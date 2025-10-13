@@ -1,0 +1,69 @@
+#!/bin/bash
+
+## Description: Review a pull request using Claude CLI
+## Usage: review [pr_url]
+## Example: review https://github.com/org/repo/pull/123
+## Example: review 123
+
+set -eu -o pipefail
+
+# Check if PR URL/number is provided
+if [ $# -eq 0 ]; then
+  echo "Error: PR URL or number is required"
+  echo "Usage: review [pr_url|pr_number]"
+  exit 1
+fi
+
+PR_ARG="$1"
+
+# Checkout the PR branch (suppress standard messages)
+if ! gh pr checkout "$PR_ARG" 2>&1 | grep -v "^Already on" | grep -v "^Your branch is up to date" | grep -v "^Already up to date"; then
+  if [ ${PIPESTATUS[0]} -ne 0 ]; then
+    echo "Error: Failed to checkout PR"
+    exit 1
+  fi
+fi
+
+# Get PR metadata first
+PR_INFO=$(gh pr view "$PR_ARG" --json title,author,body,number,url)
+PR_TITLE=$(echo "$PR_INFO" | jq -r '.title')
+PR_AUTHOR=$(echo "$PR_INFO" | jq -r '.author.login')
+PR_NUMBER=$(echo "$PR_INFO" | jq -r '.number')
+PR_BODY=$(echo "$PR_INFO" | jq -r '.body')
+PR_URL=$(echo "$PR_INFO" | jq -r '.url')
+
+# Get the PR diff for review
+PR_DIFF=$(gh pr diff "$PR_ARG")
+
+if [ -z "$PR_DIFF" ]; then
+  echo "Error: No changes found in PR"
+  exit 1
+fi
+
+# Create the review prompt
+REVIEW_PROMPT="Please review this pull request code.
+
+PR #$PR_NUMBER: $PR_TITLE
+Author: @$PR_AUTHOR
+URL: $PR_URL
+
+Description:
+$PR_BODY
+
+Focus on:
+- Code quality and best practices
+- Potential bugs or issues
+- Security concerns
+- Performance implications
+- Drupal coding standards compliance
+
+Do NOT run or suggest linting tools.
+
+Here is the PR diff:
+
+$PR_DIFF"
+
+# Invoke Claude CLI for code review
+echo "Reviewing PR #$PR_NUMBER: $PR_TITLE"
+echo ""
+claude --print "$REVIEW_PROMPT"

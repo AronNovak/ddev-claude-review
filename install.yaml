@@ -1,0 +1,26 @@
+name: ddev-claude-review
+
+project_files:
+  - commands/host/review
+
+global_files: []
+
+pre_install_actions: []
+
+post_install_actions:
+  - |
+    #ddev-description:Checking for required dependencies
+    if ! command -v gh &> /dev/null; then
+      echo "Warning: GitHub CLI (gh) is not installed. Please install it from https://cli.github.com/"
+    fi
+    if ! command -v claude &> /dev/null; then
+      echo "Warning: Claude CLI is not installed. Please install it from https://docs.anthropic.com/en/docs/claude-cli"
+    fi
+    if ! command -v jq &> /dev/null; then
+      echo "Warning: jq is not installed. Please install it (e.g., 'brew install jq' or 'apt-get install jq')"
+    fi
+    echo ""
+    echo "DDEV Claude Review add-on installed successfully!"
+    echo "Usage: ddev review [pr_url|pr_number]"
+    echo "Example: ddev review 123"
+    echo "Example: ddev review https://github.com/org/repo/pull/123"
