@@ -1,9 +1,9 @@
 name: ddev-claude-review
 
-project_files:
-  - commands/host/review
+project_files: []
 
-global_files: []
+global_files:
+  - commands/host/review
 
 pre_install_actions: []
 
