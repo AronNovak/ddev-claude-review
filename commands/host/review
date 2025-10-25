@@ -49,43 +49,49 @@ PR_NUMBER=$(echo "$PR_INFO" | jq -r '.number')
 PR_BODY=$(echo "$PR_INFO" | jq -r '.body')
 PR_URL=$(echo "$PR_INFO" | jq -r '.url')
 
-# Create the review prompt
-REVIEW_PROMPT="Please review this pull request code.
+# Build output instructions based on mode
+if [ "$POST_REVIEW" = true ]; then
+  REVIEW_MODE_INSTRUCTION=$(cat <<EOF
+Output Instructions:
+- Post each issue as an inline GitHub review comment using "gh pr review $PR_NUMBER --comment --body \"line comment\" --path \"file/path.php\" --line LINE_NUMBER".
+- Add "--start-line" when you need to reference a multi-line span.
+- After the inline comments, send a short overall summary comment with "gh pr review $PR_NUMBER --comment --body \"overall summary\"".
+- Make sure every comment names the exact file path and 1-based line numbers from the diff.
+EOF
+)
+else
+  REVIEW_MODE_INSTRUCTION=$(cat <<EOF
+Output Instructions:
+- Report the entire review in this terminal output.
+- Do not run "gh pr review".
+EOF
+)
+fi
 
-PR #$PR_NUMBER: $PR_TITLE
+# Create the review prompt
+REVIEW_PROMPT=$(cat <<EOF
+Please review pull request $PR_NUMBER for Drupal best practices and overall quality.
+
+Title: $PR_TITLE
 Author: @$PR_AUTHOR
 URL: $PR_URL
 
 Description:
 $PR_BODY
 
-IMPORTANT INSTRUCTIONS:
-1. Fetch the PR diff using: gh pr diff $PR_NUMBER
-   - If the diff is too large to read in one go, write it to a temporary file first:
-     gh pr diff $PR_NUMBER > /tmp/pr_${PR_NUMBER}_diff.txt
-     Then read the file: cat /tmp/pr_${PR_NUMBER}_diff.txt
+Preparation:
+- Fetch the diff yourself by running "gh pr diff $PR_NUMBER". If it is too large, redirect it to "/tmp/pr_${PR_NUMBER}_diff.txt" and read from there.
+- Concentrate on code quality, potential bugs, security, performance, and Drupal coding standards.
+- Do not run or suggest linting tools.
 
-2. Review the code focusing on:
-   - Code quality and best practices
-   - Potential bugs or issues
-   - Security concerns
-   - Performance implications
-   - Drupal coding standards compliance
+$REVIEW_MODE_INSTRUCTION
 
-3. Do NOT run or suggest linting tools.
-
-4. POST_REVIEW_MODE: $POST_REVIEW
-   - If POST_REVIEW_MODE is 'true', automatically post your review comments to GitHub using:
-     gh pr review $PR_NUMBER --comment -b \"your review summary\"
-   - For specific line comments, you can use:
-     gh pr review $PR_NUMBER --comment -b \"review summary\" --body \"line comment\" --path \"file/path.php\" --line LINE_NUMBER
-   - If POST_REVIEW_MODE is 'false', just display your review findings in the terminal output.
-
-5. Format your review clearly with:
-   - A summary of the changes
-   - Specific issues found (with file paths and line numbers)
-   - Suggestions for improvements
-   - Positive feedback on good practices"
+Deliverable:
+- Summary of the changes and overall risk level.
+- Specific issues with file paths and precise line numbers.
+- Actionable suggestions or follow-ups.
+EOF
+)
 
 # Invoke Claude CLI for code review
 echo "Reviewing PR #$PR_NUMBER: $PR_TITLE"
