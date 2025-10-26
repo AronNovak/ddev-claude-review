@@ -1,104 +1,344 @@
-#!/bin/bash
+#!/usr/bin/env python3
 
 ## Description: Review a pull request using Claude CLI
-## Usage: review [--post] [pr_url]
+## Usage: review [--post] [--no-summary] [pr_url]
 ## Example: review https://github.com/org/repo/pull/123
 ## Example: review 123
 ## Example: review --post 123  # Post review comments to GitHub
+## Example: review --post --no-summary 123  # Post inline comments only (no summary)
 
-set -eu -o pipefail
+import sys
+import json
+import subprocess
+import argparse
+import re
 
-# Parse command line arguments
-POST_REVIEW=false
-PR_ARG=""
+def run_command(cmd, check=True, capture_output=True):
+    """Run a shell command and return the result."""
+    result = subprocess.run(
+        cmd,
+        shell=True,
+        capture_output=capture_output,
+        text=True,
+        check=False
+    )
+    if check and result.returncode != 0:
+        print(f"Error running command: {cmd}", file=sys.stderr)
+        print(result.stderr, file=sys.stderr)
+        sys.exit(1)
+    return result
 
-while [[ $# -gt 0 ]]; do
-  case $1 in
-    --post|-p)
-      POST_REVIEW=true
-      shift
-      ;;
-    *)
-      PR_ARG="$1"
-      shift
-      ;;
-  esac
-done
+def extract_json(text):
+    """Extract JSON from text that might contain markdown code blocks."""
+    # Strategy 1: Remove markdown code fences
+    cleaned = re.sub(r'^```(?:json)?\s*$', '', text, flags=re.MULTILINE)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
 
-# Check if PR URL/number is provided
-if [ -z "$PR_ARG" ]; then
-  echo "Error: PR URL or number is required"
-  echo "Usage: review [--post] [pr_url|pr_number]"
-  echo "  --post, -p    Post review comments to GitHub automatically"
-  exit 1
-fi
+    # Strategy 2: Extract content between code fences
+    match = re.search(r'```(?:json)?\s*\n(.*?)\n```', text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            pass
 
-# Checkout the PR branch (suppress standard messages)
-if ! gh pr checkout "$PR_ARG" 2>&1 | grep -v "^Already on" | grep -v "^Your branch is up to date" | grep -v "^Already up to date"; then
-  if [ ${PIPESTATUS[0]} -ne 0 ]; then
-    echo "Error: Failed to checkout PR"
-    exit 1
-  fi
-fi
+    # Strategy 3: Find JSON object boundaries
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
 
-# Get PR metadata first
-PR_INFO=$(gh pr view "$PR_ARG" --json title,author,body,number,url)
-PR_TITLE=$(echo "$PR_INFO" | jq -r '.title')
-PR_AUTHOR=$(echo "$PR_INFO" | jq -r '.author.login')
-PR_NUMBER=$(echo "$PR_INFO" | jq -r '.number')
-PR_BODY=$(echo "$PR_INFO" | jq -r '.body')
-PR_URL=$(echo "$PR_INFO" | jq -r '.url')
+    # Strategy 4: Try the whole text
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
 
-# Build output instructions based on mode
-if [ "$POST_REVIEW" = true ]; then
-  REVIEW_MODE_INSTRUCTION=$(cat <<EOF
-Output Instructions:
-- Post each issue as an inline GitHub review comment using "gh pr review $PR_NUMBER --comment --body \"line comment\" --path \"file/path.php\" --line LINE_NUMBER".
-- Add "--start-line" when you need to reference a multi-line span.
-- After the inline comments, send a short overall summary comment with "gh pr review $PR_NUMBER --comment --body \"overall summary\"".
-- Make sure every comment names the exact file path and 1-based line numbers from the diff.
-EOF
-)
-else
-  REVIEW_MODE_INSTRUCTION=$(cat <<EOF
-Output Instructions:
-- Report the entire review in this terminal output.
-- Do not run "gh pr review".
-EOF
-)
-fi
+    return None
 
-# Create the review prompt
-REVIEW_PROMPT=$(cat <<EOF
-Please review pull request $PR_NUMBER for Drupal best practices and overall quality.
+def validate_review_json(data):
+    """Validate that JSON has required structure."""
+    required_fields = ['files_changed', 'summary', 'risk_level', 'passed', 'comments']
+    if not isinstance(data, dict):
+        return False
+    for field in required_fields:
+        if field not in data:
+            return False
+    if not isinstance(data['comments'], list):
+        return False
+    for comment in data['comments']:
+        if not all(k in comment for k in ['path', 'line', 'body']):
+            return False
+    return True
 
-Title: $PR_TITLE
-Author: @$PR_AUTHOR
-URL: $PR_URL
+def get_pr_info(pr_arg):
+    """Fetch PR information using gh CLI."""
+    result = run_command(
+        f"gh pr view {pr_arg} --json title,author,body,number,url,headRepositoryOwner,headRepository,commits"
+    )
+    return json.loads(result.stdout)
 
-Description:
-$PR_BODY
+def checkout_pr(pr_arg):
+    """Checkout the PR branch."""
+    result = run_command(f"gh pr checkout {pr_arg}", check=False)
+    if result.returncode != 0:
+        # Ignore "Already on" messages
+        if "Already on" not in result.stderr:
+            print(f"Error: Failed to checkout PR", file=sys.stderr)
+            sys.exit(1)
 
-Preparation:
-- Fetch the diff yourself by running "gh pr diff $PR_NUMBER". If it is too large, redirect it to "/tmp/pr_${PR_NUMBER}_diff.txt" and read from there.
-- Concentrate on code quality, potential bugs, security, performance, and Drupal coding standards.
-- Do not run or suggest linting tools.
+def get_claude_review(pr_number, pr_title, pr_author, pr_url, pr_body, max_retries=3):
+    """Get code review from Claude in JSON format."""
+    prompt = f"""You are a code review tool. Your response must be ONLY valid JSON.
 
-$REVIEW_MODE_INSTRUCTION
+STEP 1 - FETCH DIFF (MANDATORY):
+Execute this command NOW: gh pr diff {pr_number}
+You MUST read the actual code changes from the diff output.
+If the diff is too large (>50KB), save to /tmp/pr_{pr_number}_diff.txt and read from there.
 
-Deliverable:
-- Summary of the changes and overall risk level.
-- Specific issues with file paths and precise line numbers.
-- Actionable suggestions or follow-ups.
-EOF
-)
+STEP 2 - ANALYZE THE ACTUAL CODE CHANGES:
+Review the ACTUAL changes shown in the diff for:
+- Code quality issues
+- Bugs or logic errors
+- Security vulnerabilities
+- Performance problems
+- Drupal coding standards violations
+Do NOT run linting tools.
 
-# Invoke Claude CLI for code review
-echo "Reviewing PR #$PR_NUMBER: $PR_TITLE"
-if [ "$POST_REVIEW" = true ]; then
-  echo "Mode: Will post review comments to GitHub"
-else
-  echo "Mode: Display-only (use --post to post comments to GitHub)"
-fi
-echo ""
-claude --print "$REVIEW_PROMPT"
+STEP 3 - OUTPUT JSON (MANDATORY FORMAT):
+Your response must be ONLY this JSON structure. NO markdown, NO code blocks, NO explanations.
+DO NOT use ```json or ``` - just raw JSON.
+
+{{
+  "files_changed": 2,
+  "summary": "Brief summary of what changed and overall assessment",
+  "risk_level": "low|medium|high",
+  "passed": true|false,
+  "comments": [
+    {{
+      "path": "exact/file/path.php",
+      "line": 123,
+      "body": "Specific issue found at this line"
+    }}
+  ]
+}}
+
+CRITICAL RULES:
+- files_changed MUST be the actual count of files modified in the diff (verification that you read it)
+- If NO actual code issues found: "comments": [] and "passed": true
+- Line numbers must be EXACT line numbers from the diff (not approximate)
+- Paths must EXACTLY match what appears in the diff
+- Each comment must reference a SPECIFIC line with a SPECIFIC issue
+- Summary should be SHORT and CONCISE (1-2 sentences max)
+- Summary provides OVERALL assessment only - do NOT repeat specific line issues (those go in comments array)
+- Summary describes what you found, NOT what the PR claims to do
+
+CONTEXT:
+PR #{pr_number}: {pr_title}
+Author: {pr_author}
+URL: {pr_url}
+Description: {pr_body}
+
+BEGIN JSON OUTPUT (start with {{):"""
+
+    for attempt in range(max_retries):
+        if attempt > 0:
+            print(f"Invalid JSON received. Retry attempt {attempt}/{max_retries}...")
+
+        result = run_command(f'claude --print {json.dumps(prompt)}', check=False)
+
+        if result.returncode != 0:
+            print(f"Error running Claude CLI", file=sys.stderr)
+            print(result.stderr, file=sys.stderr)
+            continue
+
+        # Try to extract and parse JSON
+        review_data = extract_json(result.stdout)
+
+        if review_data and validate_review_json(review_data):
+            return review_data
+
+    # All retries failed
+    print(f"\nError: Failed to get valid JSON response from Claude after {max_retries} attempts", file=sys.stderr)
+    print("\nExpected JSON format:", file=sys.stderr)
+    print('{"files_changed":N,"summary":"...","risk_level":"low|medium|high","passed":true|false,"comments":[...]}', file=sys.stderr)
+    print("\nLast raw output from Claude:", file=sys.stderr)
+    print("-" * 60, file=sys.stderr)
+    print(result.stdout, file=sys.stderr)
+    print("-" * 60, file=sys.stderr)
+    sys.exit(1)
+
+def post_review_to_github(pr_number, repo_owner, repo_name, commit_id, review_data, post_summary=True):
+    """Post review comments to GitHub."""
+    print("Posting review to GitHub...")
+
+    # Post inline comments
+    comments = review_data.get('comments', [])
+    posted_count = 0
+    failed_count = 0
+
+    if comments:
+        for comment in comments:
+            path = comment['path']
+            line = comment['line']
+            body = comment['body']
+
+            print(f"Posting comment on {path}:{line}...", end=" ")
+
+            # Use subprocess.run with list arguments for proper escaping
+            result = subprocess.run(
+                [
+                    'gh', 'api', f'repos/{repo_owner}/{repo_name}/pulls/{pr_number}/comments',
+                    '-f', f'body={body}',
+                    '-f', f'path={path}',
+                    '-f', f'commit_id={commit_id}',
+                    '-F', f'line={line}',
+                    '-f', 'side=RIGHT'
+                ],
+                capture_output=True,
+                text=True
+            )
+
+            if result.returncode == 0:
+                print("✓")
+                posted_count += 1
+            else:
+                print("✗")
+                print(f"  Error: {result.stderr}", file=sys.stderr)
+                failed_count += 1
+
+        if posted_count > 0:
+            print(f"Posted {posted_count} inline comment(s)")
+        if failed_count > 0:
+            print(f"Failed to post {failed_count} inline comment(s)", file=sys.stderr)
+
+    # Post summary comment (if requested)
+    if post_summary:
+        files_changed = review_data['files_changed']
+        summary = review_data['summary']
+        risk_level = review_data['risk_level'].upper()
+        passed = review_data['passed']
+        status = "✅ PASSED" if passed else "❌ NEEDS WORK"
+
+        inline_count = len(comments)
+        comment_text = "comment" if inline_count == 1 else "comments"
+
+        summary_comment = f"""## AI Code Review
+
+**Files Changed:** {files_changed}
+**Risk Level:** {risk_level}
+**Status:** {status}
+**Inline Comments:** {inline_count}
+
+{summary}
+
+---
+*Review generated by DDEV Claude Review*"""
+
+        print("Posting summary comment...", end=" ")
+
+        # Use subprocess.run with list arguments to avoid escaping issues
+        result = subprocess.run(
+            ['gh', 'pr', 'comment', str(pr_number), '--body', summary_comment],
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode == 0:
+            print("✓")
+            return True
+        else:
+            print("✗")
+            print(f"Error posting summary: {result.stderr}", file=sys.stderr)
+            return False
+    else:
+        print("Skipping summary comment (--no-summary)")
+        return True
+
+def display_review_terminal(pr_number, review_data):
+    """Display review in terminal."""
+    print("=" * 78)
+    print(f"📋 AI CODE REVIEW - PR #{pr_number}")
+    print("=" * 78)
+    print()
+
+    files_changed = review_data['files_changed']
+    summary = review_data['summary']
+    risk_level = review_data['risk_level'].upper()
+    passed = review_data['passed']
+    status = "✅ PASSED" if passed else "❌ NEEDS WORK"
+
+    print(f"Files Changed: {files_changed}")
+    print(f"Status: {status}")
+    print(f"Risk Level: {risk_level}")
+    print()
+    print("Summary:")
+    print(summary)
+    print()
+
+    comments = review_data.get('comments', [])
+    if comments:
+        print("=" * 78)
+        print(f"📍 INLINE COMMENTS ({len(comments)})")
+        print("=" * 78)
+        print()
+
+        for comment in comments:
+            print(f"📄 {comment['path']}:{comment['line']}")
+            print(f"   {comment['body']}")
+            print()
+    else:
+        print("=" * 78)
+        print("✨ No issues found - code looks good!")
+        print("=" * 78)
+    print()
+
+def main():
+    parser = argparse.ArgumentParser(description='Review a pull request using Claude CLI')
+    parser.add_argument('pr', help='PR number or URL')
+    parser.add_argument('--post', '-p', action='store_true', help='Post review comments to GitHub')
+    parser.add_argument('--no-summary', action='store_true', help='Skip posting summary comment (inline comments only)')
+
+    args = parser.parse_args()
+
+    # Checkout PR
+    checkout_pr(args.pr)
+
+    # Get PR info
+    pr_info = get_pr_info(args.pr)
+    pr_number = pr_info['number']
+    pr_title = pr_info['title']
+    pr_author = pr_info['author']['login']
+    pr_body = pr_info.get('body', '')
+    pr_url = pr_info['url']
+    repo_owner = pr_info['headRepositoryOwner']['login']
+    repo_name = pr_info['headRepository']['name']
+    commit_id = pr_info['commits'][-1]['oid']  # Latest commit
+
+    print(f"Reviewing PR #{pr_number}: {pr_title}")
+    if args.post:
+        print("Mode: Will post review comments to GitHub")
+    else:
+        print("Mode: Display-only (use --post to post comments to GitHub)")
+    print()
+
+    # Get review from Claude
+    review_data = get_claude_review(pr_number, pr_title, pr_author, pr_url, pr_body)
+
+    # Post or display
+    if args.post:
+        post_review_to_github(pr_number, repo_owner, repo_name, commit_id, review_data,
+                             post_summary=not args.no_summary)
+        print()
+        print(f"✅ Review posted successfully to PR #{pr_number}")
+        print(f"View at: {pr_url}")
+    else:
+        display_review_terminal(pr_number, review_data)
+
+if __name__ == '__main__':
+    main()
